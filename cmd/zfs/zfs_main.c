@@ -92,6 +92,7 @@ static boolean_t log_history = B_TRUE;
 static int zfs_do_clone(int argc, char **argv);
 static int zfs_do_create(int argc, char **argv);
 static int zfs_do_destroy(int argc, char **argv);
+static int zfs_do_clean(int argc, char **argv);
 static int zfs_do_get(int argc, char **argv);
 static int zfs_do_inherit(int argc, char **argv);
 static int zfs_do_list(int argc, char **argv);
@@ -127,6 +128,7 @@ static int zfs_do_redact(int argc, char **argv);
 static int zfs_do_jail(int argc, char **argv);
 static int zfs_do_unjail(int argc, char **argv);
 #endif
+#include <thread_pool.h>
 
 /*
  * Enable a reasonable set of defaults for libumem debugging on DEBUG builds.
@@ -150,6 +152,7 @@ typedef enum {
 	HELP_CLONE,
 	HELP_CREATE,
 	HELP_DESTROY,
+	HELP_CLEAN,
 	HELP_GET,
 	HELP_INHERIT,
 	HELP_UPGRADE,
@@ -206,6 +209,7 @@ static zfs_command_t command_table[] = {
 	{ NULL },
 	{ "create",	zfs_do_create,		HELP_CREATE		},
 	{ "destroy",	zfs_do_destroy,		HELP_DESTROY		},
+	{ "clean",	zfs_do_clean,		HELP_CLEAN		},
 	{ NULL },
 	{ "snapshot",	zfs_do_snapshot,	HELP_SNAPSHOT		},
 	{ "rollback",	zfs_do_rollback,	HELP_ROLLBACK		},
@@ -276,6 +280,11 @@ get_usage(zfs_help_t idx)
 		    "\tdestroy [-dnpRrv] "
 		    "<filesystem|volume>@<snap>[%<snap>][,...]\n"
 		    "\tdestroy <filesystem|volume>#<bookmark>\n"));
+	case HELP_CLEAN:
+		return (gettext("\tclean [-yvndfpre] [-V level]"
+				" [-a age] [-E prop] [-T time]"
+				" [-P workers] [-M snaps]"
+				"<filesystem|volume> ...\n"));
 	case HELP_GET:
 		return (gettext("\tget [-rHp] [-d max] "
 		    "[-o \"all\" | field[,...]]\n"
@@ -327,8 +336,9 @@ get_usage(zfs_help_t idx)
 	case HELP_SHARE:
 		return (gettext("\tshare [-l] <-a [nfs|smb] | filesystem>\n"));
 	case HELP_SNAPSHOT:
-		return (gettext("\tsnapshot [-r] [-o property=value] ... "
-		    "<filesystem|volume>@<snap> ...\n"));
+		return (gettext("\tsnapshot|snap [-n] [-v] [-r] "
+		    "[-m minfree] [-E prop] [-e time] [-T time] [-o property=value]"
+		    "... <filesystem|volume>@<snap> ...\n"));
 	case HELP_UNMOUNT:
 		return (gettext("\tunmount [-fu] "
 		    "<-a | filesystem|mountpoint>\n"));
@@ -1137,6 +1147,17 @@ badusage:
 	return (2);
 }
 
+
+typedef struct {
+	int 		max_threads;
+  	int 		min_snaps;
+  	tpool_t 	*tp;
+  	int 		err;
+  	size_t 		cleaned_snaps;
+  	pthread_mutex_t lock;
+} cleaners_t;
+
+
 /*
  * zfs destroy [-rRf] <fs, vol>
  * zfs destroy [-rRd] <snap>
@@ -1164,6 +1185,13 @@ typedef struct destroy_cbdata {
 	nvlist_t	*cb_nvl;
 	nvlist_t	*cb_batchedsnaps;
 
+	/* 'zfs clean' flags & data */
+  	int		cb_clean;
+	time_t          cb_max_age;
+	char            *cb_expires_prop;	
+  	boolean_t	cb_yesno;
+	cleaners_t      cb_cleaners;
+  
 	/* first snap in contiguous run */
 	char		*cb_firstsnap;
 	/* previous snap in contiguous run */
@@ -1173,6 +1201,17 @@ typedef struct destroy_cbdata {
 	char		*cb_bookmark;
 	uint64_t	cb_snap_count;
 } destroy_cbdata_t;
+
+
+
+static void
+sigalrm_handler(int sig) {
+	static char msg[] = "\n*** ABORTED DUE TO TIMEOUT ***\n";
+	
+	(void) write(2, msg, sizeof(msg)-1);
+	_exit(1);
+}
+
 
 /*
  * Check for any dependents based on the '-r' or '-R' flags.
@@ -1251,7 +1290,12 @@ destroy_callback(zfs_handle_t *zhp, void *data)
 	const char *name = zfs_get_name(zhp);
 	int error;
 
-	if (cb->cb_verbose) {
+	if (cb->cb_clean) {
+	  	if (cb->cb_parsable)
+		  	(void) printf("%s%s\n",
+				      cb->cb_clean > 1 ? "- " : "",
+				      name);
+	} else if (cb->cb_verbose) {
 		if (cb->cb_parsable) {
 			(void) printf("destroy\t%s\n", name);
 		} else if (cb->cb_dryrun) {
@@ -1311,6 +1355,28 @@ destroy_callback(zfs_handle_t *zhp, void *data)
 	return (0);
 }
 
+static void
+spin(void) {
+	static char dials[] = "|/-\\";
+  	static int p = 0;
+	static time_t last = 0;
+	time_t now;
+	
+	if (isatty(fileno(stderr))) {
+	  	time(&now);
+		if (now != last) {
+#if 1
+		  	putc(dials[p], stderr);
+			putc('\b', stderr);
+#else
+			putc('.', stderr);
+#endif
+			p = (p+1)&3;
+			last = now;
+		}
+	}
+}
+
 static int
 destroy_print_cb(zfs_handle_t *zhp, void *arg)
 {
@@ -1327,7 +1393,10 @@ destroy_print_cb(zfs_handle_t *zhp, void *arg)
 		cb->cb_prevsnap = strdup(name);
 		if (cb->cb_firstsnap == NULL || cb->cb_prevsnap == NULL)
 			nomem();
-		if (cb->cb_verbose) {
+		if (cb->cb_clean) {
+		  	if (cb->cb_parsable)
+				(void) printf("- %s\n", name);
+		} else if (cb->cb_verbose) {
 			if (cb->cb_parsable) {
 				(void) printf("destroy\t%s\n", name);
 			} else if (cb->cb_dryrun) {
@@ -1338,7 +1407,11 @@ destroy_print_cb(zfs_handle_t *zhp, void *arg)
 				    name);
 			}
 		}
-	} else if (cb->cb_firstsnap != NULL) {
+		zfs_close(zhp);
+		return (err);
+	}
+
+ 	if (cb->cb_firstsnap != NULL) {
 		/* end of this range */
 		uint64_t used = 0;
 		err = lzc_snaprange_space(cb->cb_firstsnap,
@@ -1375,41 +1448,109 @@ destroy_print_snapshots(zfs_handle_t *fs_zhp, destroy_cbdata_t *cb)
 	return (err);
 }
 
+
 static int
 snapshot_to_nvl_cb(zfs_handle_t *zhp, void *arg)
 {
 	destroy_cbdata_t *cb = arg;
 	int err = 0;
 
+
+	if (cb->cb_clean)
+	  	spin();
+	
+	if (zfs_get_type(zhp) == ZFS_TYPE_SNAPSHOT) {
+		if (cb->cb_max_age) {
+			time_t created;
+	    
+			if ((created = zfs_prop_get_int(zhp, ZFS_PROP_CREATION)) >= cb->cb_max_age) {
+				if (cb->cb_clean > 4)
+					printf(gettext("skipping destroy of '%s'"
+					    ": creation too new (%llu >= %llu)\n"),
+					    zfs_get_name(zhp),
+					    (unsigned long long) created,
+					    (unsigned long long) cb->cb_max_age);
+				goto Out;
+			}
+		}
+	  
+		if (cb->cb_expires_prop) {
+			time_t now, expires;
+			nvlist_t *userprops = zfs_get_user_props(zhp);
+			nvlist_t *propval = NULL;
+			char *strval = NULL;
+			
+			time(&now);
+			(void) nvlist_lookup_nvlist(userprops, cb->cb_expires_prop, &propval);
+			
+			if (!propval || nvlist_lookup_string(propval, ZPROP_VALUE, &strval) != 0) {
+				if (cb->cb_clean > 4)
+					printf(gettext("skipping destroy of '%s'"
+					    ": expire property (%s) not set or invalid\n"),
+					    zfs_get_name(zhp),
+					    cb->cb_expires_prop);
+				goto Out;
+			}
+			
+			if (sscanf(strval, "%lu", &expires) == 1 && now < expires) {
+				if (cb->cb_clean > 4)
+					printf(gettext("skipping destroy of '%s'"
+					    ": not expired: %s"),
+					    zfs_get_name(zhp),
+					    ctime(&expires));
+				goto Out;
+			}
+		}
+	}
+	
 	/* Check for clones. */
 	if (!cb->cb_doclones && !cb->cb_defer_destroy) {
 		cb->cb_target = zhp;
 		cb->cb_first = B_TRUE;
 		err = zfs_iter_dependents(zhp, B_TRUE,
 		    destroy_check_dependent, cb);
+		if (err)
+			goto Out;
 	}
+	if (nvlist_add_boolean(cb->cb_nvl, zfs_get_name(zhp)))
+		nomem();
 
-	if (err == 0) {
-		if (nvlist_add_boolean(cb->cb_nvl, zfs_get_name(zhp)))
-			nomem();
-	}
+ Out:
 	zfs_close(zhp);
 	return (err);
 }
+
 
 static int
 gather_snapshots(zfs_handle_t *zhp, void *arg)
 {
 	destroy_cbdata_t *cb = arg;
 	int err = 0;
+	size_t ns, ons = 0;
 
+	
+	if (cb->cb_clean > 1)
+	  	ons = fnvlist_num_pairs(cb->cb_nvl);
+		
 	err = zfs_iter_snapspec(zhp, cb->cb_snapspec, snapshot_to_nvl_cb, cb);
+	
+	if (cb->cb_clean > 1) {
+	  	ns = fnvlist_num_pairs(cb->cb_nvl);
+		if (ns-ons > 0 || cb->cb_clean > 2)
+		  	printf("%-30s\t: %3ld snapshot%s to delete [%ld]\n",
+			       zfs_get_name(zhp),
+			       ns-ons,
+			       ns-ons == 1 ? "" : "s",
+			       ns);
+	}
+	
 	if (err == ENOENT)
 		err = 0;
 	if (err != 0)
 		goto out;
 
-	if (cb->cb_verbose) {
+	
+	if (cb->cb_verbose || cb->cb_clean) {
 		err = destroy_print_snapshots(zhp, cb);
 		if (err != 0)
 			goto out;
@@ -1450,6 +1591,186 @@ destroy_clones(destroy_cbdata_t *cb)
 		}
 	}
 	return (0);
+}
+
+
+#define PYN_NONE -2
+#define PYN_EOF  -1
+#define PYN_NO    0
+#define PYN_YES   1
+#define PYN_ALL   2
+
+static int
+prompt_yesno(const char *fmt,
+	     ...) {
+	va_list ap;
+	char *cp, buf[32];
+	int t = 0;
+
+	fflush(stdout);
+	
+	/* Assume 'no' if no TTY to prompt user */
+	if (!isatty(fileno(stderr))) {
+		va_start(ap, fmt);
+		vfprintf(stderr, fmt, ap);
+		va_end(ap);
+		fprintf(stderr, " {no, yes, none, all} [none]? ");
+		fprintf(stderr, "nome\n");
+		return PYN_NONE;
+	}
+  
+	while (t++ < 3) {
+	  	if (t > 1)
+		  	fprintf(stderr,
+				"*** Please answer 'no', 'yes', 'none' or 'all'\n");
+		
+		va_start(ap, fmt);
+		vfprintf(stderr, fmt, ap);
+		va_end(ap);
+		fprintf(stderr, " {no, yes, none, all} [no]? ");
+    
+		if (fgets(buf, sizeof(buf), stdin) == NULL) {
+			/* Assume 'no' if we get EOF */
+		  fputs("none\n", stderr);
+		  return PYN_NONE;
+		}
+    
+		for (cp = buf+strlen(buf)-1; cp >= buf && isspace(*cp); --cp)
+			;
+		*++cp = '\0';
+		for (cp = buf; isspace(*cp); ++cp)
+			;
+		if (strcasecmp(cp, "yes") == 0)
+			return PYN_YES;
+		else if (strcasecmp(cp, "all") == 0)
+			return PYN_ALL;
+		else if (strcasecmp(cp, "none") == 0)
+			return PYN_NONE;
+		else if (!*cp ||
+			 strcasecmp(cp, "no") == 0 ||
+			 strcasecmp(cp, "n") == 0)
+	       		return PYN_NO;
+	}
+
+	fprintf(stderr, "*** Assuming 'no'\n");
+	return 0;
+}
+
+
+#define STR2TIME_BEFORE   -1
+#define STR2TIME_RELATIVE  0
+#define STR2TIME_AFTER     1
+
+static int
+str2time(const char *str,
+	 time_t *rtp,
+	 int absolute) {
+  	char pfx = 0;
+	int rc;
+	time_t now, t;
+	int t_year, t_mon, t_day, t_hour, t_min, t_sec;
+	struct tm *tp;
+
+	
+	if (!str || !*str)
+		return 0;
+
+	time(&now);
+	
+	while (isspace(*str))
+		++str;
+
+	t_year = t_mon = t_day = t_hour = t_min = t_sec = 0;
+
+	if ((rc = sscanf(str, "%d-%d-%d %d:%d:%d",
+			 &t_year, &t_mon, &t_day,
+			 &t_hour, &t_min, &t_sec)) >= 5 || rc == 3) {
+	  /* Absolute date+time */
+	  tp = localtime(&now);
+	  if (!tp)
+	  	return -1;
+
+	  if (t_year >= 1900)
+	  	tp->tm_year = t_year-1900;
+	  else
+	  	tp->tm_year = t_year+100;
+
+	  tp->tm_mon  = t_mon-1;
+	  tp->tm_mday = t_day;
+	  tp->tm_hour = t_hour;
+	  tp->tm_min  = t_min;
+	  tp->tm_sec  = t_sec;;
+	  
+	  t = mktime(tp);
+	  if (t == (time_t) -1)
+	    	return -1;
+
+	  if (!absolute)
+	    t -= now;
+	  
+	  *rtp = t;
+	  return 1;
+    
+	} else if ((rc = sscanf(str, "%d:%d:%d",
+				&t_hour, &t_min, &t_sec)) >= 2) {
+	  	t = t_sec + (t_min*60) + (t_hour*3600);
+		
+		if (absolute)
+		  t += (absolute * now);
+		*rtp = t;
+		return 1;
+    
+	} else if ((rc = sscanf(str, "%lu%c", &t, &pfx)) >= 1) {
+	  	/* Offset from now */
+    
+		switch (pfx) {
+		case 's':
+		case 'S':
+		  	break;
+		case 'm':
+		  	t *= 60;
+			break;
+		case 'h':
+		case 'H':
+		  	t *= 60*60;
+			break;
+		case 'd':
+		case 'D':
+		  	t *= 24*60*60;
+			break;
+		case 'w':
+		case 'W':
+		  	t *= 7*24*60*60;
+			break;
+		case 'M':
+		  	t *= 30*24*60*60;
+			break;
+		case 'q':
+		case 'Q':
+		  	t *= 91*24*60*60;
+			break;
+		case 'y':
+		case 'Y':
+		  	t *= 365*24*60*60;
+			break;
+		default:
+		  	return -1;
+		}
+
+		switch (absolute) {
+		case STR2TIME_BEFORE:
+		  *rtp = now - t;
+		  break;
+		case STR2TIME_AFTER:
+		  *rtp = now + t;
+		  break;
+		case STR2TIME_RELATIVE:
+		  *rtp = t;
+		}
+		return 1;
+	}
+	
+	return (rc == 0 ? 0 : -1);
 }
 
 static int
@@ -1688,6 +2009,405 @@ out:
 	fnvlist_free(cb.cb_nvl);
 	if (zhp != NULL)
 		zfs_close(zhp);
+	return (rv);
+}
+
+
+static char *
+strdupcat(const char *s1, ...) {
+  	char *res, *s;
+	size_t len;
+	va_list ap;
+	
+	va_start(ap, s1);
+	len = strlen(s1);
+	while ((s = va_arg(ap, char *)) != NULL)
+	  	len += strlen(s);
+	va_end(ap);
+	
+	res = malloc(len+1);
+	if (!res)
+	  	return NULL;
+	strcpy(res, s1);
+	
+	va_start(ap, s1);
+	while ((s = va_arg(ap, char *)) != NULL)
+	  	strcat(res, s);
+	va_end(ap);
+	
+	return res;
+}
+
+
+typedef struct {
+  	nvlist_t *ct_nvl;
+  	destroy_cbdata_t *ct_cb;
+} clean_tdata_t;
+
+
+static void
+destroy_snaps_nvl_task(void *vp) {
+  	clean_tdata_t *ct = (clean_tdata_t *) vp;
+	int err;
+	size_t nsnaps;
+
+	nsnaps = fnvlist_num_pairs(ct->ct_nvl);
+
+	if (ct->ct_cb->cb_verbose) {
+		printf("Deleting %ld snapshot%s\n",
+		       nsnaps,
+		       nsnaps == 1 ? "" : "s");
+	}
+
+	err = zfs_destroy_snaps_nvl(g_zfs, ct->ct_nvl,
+				    ct->ct_cb->cb_defer_destroy);
+
+	if (!err) {
+	  	pthread_mutex_lock(&ct->ct_cb->cb_cleaners.lock);
+		ct->ct_cb->cb_cleaners.cleaned_snaps += nsnaps;
+	  	pthread_mutex_unlock(&ct->ct_cb->cb_cleaners.lock);
+	}
+	
+	nvlist_free(ct->ct_nvl);
+	ct->ct_nvl = NULL;
+	free(ct);
+}
+
+
+int
+clean_snapshots(zfs_handle_t *zhp,
+		destroy_cbdata_t *cb) {
+  	int nsnaps;
+	int err = 0;
+	clean_tdata_t *ct = NULL;
+
+	if (!cb->cb_nvl)
+	  	goto OUT;
+
+	/* No snaps to delete */
+	nsnaps = fnvlist_num_pairs(cb->cb_nvl);
+	if (!nsnaps) {
+		fnvlist_free(cb->cb_nvl);
+		cb->cb_nvl = NULL;
+	  	goto OUT;
+	}
+	
+	if (err != 0) {
+		fnvlist_free(cb->cb_nvl);
+		cb->cb_nvl = NULL;
+	  	goto OUT;
+	}
+
+	/* If dryrun, just drop the collected list and go on */
+	if (cb->cb_dryrun) {
+		fnvlist_free(cb->cb_nvl);
+		cb->cb_nvl = NULL;
+		goto OUT;
+	}
+
+	/* Punt on cleaning until we've collected enough snaps */
+	if (cb->cb_cleaners.min_snaps && nsnaps < cb->cb_cleaners.min_snaps)
+		goto OUT;
+
+	/* Prompt the user */
+	if (!cb->cb_yesno) {
+		int rc;
+		char buf[16];
+      
+		zfs_nicenum(cb->cb_snapused, buf, sizeof (buf));
+		rc = prompt_yesno("Delete %d snapshot%s %s%s%s",
+				  nsnaps,
+				  nsnaps == 1 ? "" : "s",
+				  cb->cb_verbose ? "(" : "",
+				  cb->cb_verbose ? buf : "",
+				  cb->cb_verbose ? "B)" : "");
+
+		if (rc == PYN_NONE || rc == PYN_ALL)
+		  	cb->cb_yesno = rc;
+		
+		if (rc < PYN_YES) {
+			/* Negative answer - Get rid of these snapshots */
+		  	fnvlist_free(cb->cb_nvl);
+			cb->cb_nvl = NULL;
+
+			if (rc == -2)
+			  	err = ENOENT;
+			goto OUT;
+		}
+	}
+
+	/* Start a new cleaner task */
+	ct = malloc(sizeof(*ct));
+	if (!ct)
+		nomem();
+	
+	ct->ct_cb   = cb;
+	ct->ct_nvl  = cb->cb_nvl;
+	cb->cb_nvl  = NULL;
+	
+	if (cb->cb_cleaners.max_threads > 1)
+		(void) tpool_dispatch(cb->cb_cleaners.tp, destroy_snaps_nvl_task, (void *) ct);
+	else
+		(void) destroy_snaps_nvl_task((void *) ct);
+	
+ OUT:
+	zfs_close(zhp);
+	return (err);
+}
+
+
+int
+gather_clean_snapshots(zfs_handle_t *zhp,
+			  destroy_cbdata_t *cb) {
+	int err = 0;
+	size_t ons = 0;
+	size_t nns;
+
+
+	if (!cb->cb_nvl)
+	  	cb->cb_nvl = fnvlist_alloc();
+	if (cb->cb_verbose)
+	  	ons = fnvlist_num_pairs(cb->cb_nvl);
+	
+	err = zfs_iter_snapspec(zhp, cb->cb_snapspec, snapshot_to_nvl_cb, cb);
+	if (err == ENOENT)
+	  	err = 0;
+	
+	if (err) {
+		fnvlist_free(cb->cb_nvl);
+		cb->cb_nvl = NULL;
+	  	return (err);
+	}
+
+	if (cb->cb_verbose) {
+	  	nns = fnvlist_num_pairs(cb->cb_nvl);
+		if (nns-ons > 0 || cb->cb_clean > 1) {
+			printf("%-30s\t: %3ld snapshot%s to %sdelete [%ld]\n",
+			       zfs_get_name(zhp),
+			       nns-ons,
+			       nns-ons == 1 ? "" : "s",
+			       cb->cb_dryrun ? "(NOT) " : "",
+			       nns);
+		}
+	}
+	
+	err = clean_snapshots(zfs_handle_dup(zhp), cb);
+	
+	if (cb->cb_recurse)
+	  err = zfs_iter_filesystems(zhp, (int (*)(zfs_handle_t *, void *)) gather_clean_snapshots, cb);
+
+	zfs_close(zhp);
+	return (err);
+}  
+
+
+/*
+ * Limited variant of "destroy" that _only_ does snapshots, and allows
+ * multiple datasets listed on the command line.
+ */
+static int
+zfs_do_clean(int argc, char **argv)
+{
+	destroy_cbdata_t cb = { 0 };
+	int rv = 0;
+	int c;
+	zfs_handle_t *zhp = NULL;
+	char *at, *pound;
+	time_t timeout = 0;
+	char *expires_prop = "se.liu.it:expires";
+	boolean_t check_expire = 0;
+	size_t nsnaps;
+	
+	cb.cb_clean = 1;
+	pthread_mutex_init(&cb.cb_cleaners.lock, NULL);
+	
+	/* check options */
+	while ((c = getopt(argc, argv, "yvpndfrV:A:E:eT:P:M:")) != -1) {
+		switch (c) {
+		case 'y':
+			cb.cb_yesno = B_TRUE;
+			break;
+		case 'v':
+			cb.cb_verbose = B_TRUE;
+			break;
+		case 'p':
+			cb.cb_parsable = B_TRUE;
+			break;
+		case 'n':
+			cb.cb_dryrun = B_TRUE;
+			break;
+		case 'd':
+			cb.cb_defer_destroy = B_TRUE;
+			break;
+		case 'f':
+			cb.cb_force = B_TRUE;
+			break;
+		case 'r':
+			cb.cb_recurse = B_TRUE;
+			break;
+		case 'V':
+			if (!optarg || sscanf(optarg, "%d", &cb.cb_clean) != 1) {
+				(void) fprintf(stderr,
+				    gettext("invalid verbosity level '%s'"), optarg ? optarg : "");
+				goto OUT;
+			}
+			cb.cb_clean++;
+			break;
+		case 'P':
+		  	if (!optarg || sscanf(optarg, "%d", &cb.cb_cleaners.max_threads) != 1) {
+				(void) fprintf(stderr,
+				    gettext("invalid parallelism value '%s'"), optarg ? optarg : "");
+				goto OUT;
+			}
+			break;
+		case 'M':
+		  	if (!optarg || sscanf(optarg, "%d", &cb.cb_cleaners.min_snaps) != 1) {
+				(void) fprintf(stderr,
+				    gettext("invalid minimum snaps per clean '%s'"), optarg ? optarg : "");
+				goto OUT;
+			}
+			break;
+		case 'E':
+		  	expires_prop = strdup(optarg);
+			check_expire = B_TRUE;
+			break;
+		case 'e':
+		  	check_expire = B_TRUE;
+			break;
+		case 'a':
+		  	if (str2time(optarg, &cb.cb_max_age, STR2TIME_BEFORE) < 1) {
+				(void) fprintf(stderr,
+				    gettext("invalid max age '%s'"), optarg ? optarg : "");
+				goto OUT;
+			}
+			break;
+		case 'T':
+			if (str2time(optarg, &timeout, STR2TIME_RELATIVE) < 1 || timeout < 0) {
+				(void) fprintf(stderr,
+			            gettext("invalid timeout '%s'"), optarg ? optarg : "");
+				goto OUT;
+			}
+			break;
+		case '?':
+		default:
+			(void) fprintf(stderr, gettext("invalid option '%c'\n"),
+			    optopt);
+			usage(B_FALSE);
+		}
+	}
+
+	if (check_expire)
+	  	cb.cb_expires_prop = strdup(expires_prop);
+	
+	if (timeout) {
+		signal(SIGALRM, sigalrm_handler);
+		alarm(timeout);
+	}
+	
+	argc -= optind;
+	argv += optind;
+
+	/* check number of arguments */
+	if (argc == 0) {
+		(void) fprintf(stderr, gettext("missing dataset argument\n"));
+		usage(B_FALSE);
+	}
+
+	if (cb.cb_cleaners.max_threads > 1) {
+	  /* Wait for all threads to finish */
+	  cb.cb_cleaners.tp = tpool_create(1, cb.cb_cleaners.max_threads, 0, NULL);
+	}
+	  
+	/* Build the list of snaps to destroy in cb_nvl. */
+	cb.cb_nvl = fnvlist_alloc();
+	zhp = NULL;
+	
+	while (argc > 0) {
+		char *fsname = NULL;
+		int err;
+		
+		pound = strchr(argv[0], '#');
+		if (pound) {
+		  	(void) fprintf(stderr,
+			    "clean is not supported with bookmarks\n");
+			return (-1);
+		}
+
+		/* Make sure we always have a snapshot specifier (@<something>) */
+		if (strchr(argv[0], '@'))
+			fsname = strdupcat(argv[0], NULL);
+		else
+			fsname = strdupcat(argv[0], "@", "%", NULL);
+	  
+		at = strchr(fsname, '@');
+		*at = '\0';
+
+		if (zhp != NULL) {
+		  	zfs_close(zhp);
+			zhp = NULL;
+		}
+		
+		zhp = zfs_open(g_zfs, fsname,
+			       ZFS_TYPE_FILESYSTEM | ZFS_TYPE_VOLUME);
+		if (zhp == NULL)
+			return (1);
+	  
+		cb.cb_snapspec = at + 1;
+
+		if (cb.cb_cleaners.max_threads) {
+		  	err = gather_clean_snapshots(zfs_handle_dup(zhp), &cb);
+			if (err != 0 || cb.cb_error) {
+			  	rv = 1;
+				goto OUT;
+			}
+
+			goto NEXT;
+		} else
+		  	err = gather_snapshots(zfs_handle_dup(zhp), &cb);
+		
+		if (err != 0 || cb.cb_error) {
+			rv = 1;
+			goto OUT;
+		}
+
+	NEXT:
+		--argc;
+		++argv;
+	}
+	
+	/* Still got some more snaps to clean? */
+	if (cb.cb_nvl) {
+	  	cb.cb_cleaners.min_snaps = 0;
+	  	clean_snapshots(zfs_handle_dup(zhp), &cb);
+	}
+
+	/* Wait for all threads to finish */
+	if (cb.cb_cleaners.max_threads > 1) {
+	  	tpool_wait(cb.cb_cleaners.tp);
+		tpool_destroy(cb.cb_cleaners.tp);
+		if (cb.cb_cleaners.err)
+		  	rv = 1;
+		goto OUT;
+	}
+
+	if (zhp != NULL) {
+	  	zfs_close(zhp);
+		zhp = NULL;
+	}
+
+	if (cb.cb_clean > 2)
+	  	printf("Total snapshots deleted: %ld\n",
+		       cb.cb_cleaners.cleaned_snaps);
+	  
+	if (nsnaps == 0)
+	  	goto OUT;
+	  
+ OUT:
+	if (cb.cb_nvl)
+		fnvlist_free(cb.cb_nvl);
+	if (zhp != NULL)
+		zfs_close(zhp);
+	
 	return (rv);
 }
 
@@ -4076,6 +4796,9 @@ typedef struct snap_cbdata {
 	nvlist_t *sd_nvl;
 	boolean_t sd_recursive;
 	const char *sd_snapname;
+	uint64_t sd_min_avail;
+	boolean_t sd_verbose;
+	boolean_t sd_no_update;
 } snap_cbdata_t;
 
 static int
@@ -4085,18 +4808,30 @@ zfs_snapshot_cb(zfs_handle_t *zhp, void *arg)
 	char *name;
 	int rv = 0;
 	int error;
-
+	uint64_t avail;
+     
 	if (sd->sd_recursive &&
 	    zfs_prop_get_int(zhp, ZFS_PROP_INCONSISTENT) != 0) {
 		zfs_close(zhp);
 		return (0);
 	}
 
-	error = asprintf(&name, "%s@%s", zfs_get_name(zhp), sd->sd_snapname);
-	if (error == -1)
-		nomem();
-	fnvlist_add_boolean(sd->sd_nvl, name);
-	free(name);
+	if (sd->sd_min_avail && (avail = zfs_prop_get_int(zhp, ZFS_PROP_AVAILABLE)) < sd->sd_min_avail) {
+	  if (sd->sd_verbose) {
+	    fprintf(stderr,
+		    gettext("skipping snapshot of '%s'"
+			    ": avail too low (%llu < %llu)\n"),
+		    zfs_get_name(zhp),
+		    (unsigned long long) avail,
+		    (unsigned long long) sd->sd_min_avail);
+	  }
+	} else {
+		error = asprintf(&name, "%s@%s", zfs_get_name(zhp), sd->sd_snapname);
+		if (error == -1)
+			nomem();
+		fnvlist_add_boolean(sd->sd_nvl, name);
+		free(name);
+	}
 
 	if (sd->sd_recursive)
 		rv = zfs_iter_filesystems(zhp, zfs_snapshot_cb, sd);
@@ -4104,8 +4839,10 @@ zfs_snapshot_cb(zfs_handle_t *zhp, void *arg)
 	return (rv);
 }
 
+#define DEFAULT_EXPIRE_PROP "se.liu.it:expires"
+
 /*
- * zfs snapshot [-r] [-o prop=value] ... <fs@snap>
+ * zfs snapshot [-v] [-n] [-r] [-m minfree] [-e prop] [-a age] [-o prop=value] ... <fs@snap>
  *
  * Creates a snapshot with the given name.  While functionally equivalent to
  * 'zfs create', it is a separate command to differentiate intent.
@@ -4118,15 +4855,80 @@ zfs_do_snapshot(int argc, char **argv)
 	nvlist_t *props;
 	snap_cbdata_t sd = { 0 };
 	boolean_t multiple_snaps = B_FALSE;
+	char pfx, buf[64];
+	unsigned long avail = 0;
+	time_t timeout = 0;
+	size_t nsnaps;
+	char *expire_prop = NULL;
+	time_t expire_time = 0;
+	char *strval;
 
 	if (nvlist_alloc(&props, NV_UNIQUE_NAME, 0) != 0)
 		nomem();
 	if (nvlist_alloc(&sd.sd_nvl, NV_UNIQUE_NAME, 0) != 0)
 		nomem();
 
+	sd.sd_min_avail = 0;
+	sd.sd_verbose = 0;
+	sd.sd_no_update = 0;
+
 	/* check options */
-	while ((c = getopt(argc, argv, "ro:")) != -1) {
+	while ((c = getopt(argc, argv, "ro:nvm:t:T:e:E:")) != -1) {
 		switch (c) {
+		case 'n':
+			sd.sd_no_update = 1;
+			break;
+		case 'v':
+			sd.sd_verbose = 1;
+			break;
+		case 'm':
+			pfx = 0;
+			if (!optarg ||
+			    sscanf(optarg, "%lu%c",
+			    &avail, &pfx) < 1) {
+				(void) fprintf(stderr,
+				    gettext("invalid minfree '%s'"), optarg);
+				goto usage;
+			}
+			sd.sd_min_avail = avail;
+			switch (toupper(pfx)) {
+			case 'K':
+				sd.sd_min_avail *= 1000;
+				break;
+			case 'M':
+				sd.sd_min_avail *= 1000000;
+				break;
+			case 'G':
+				sd.sd_min_avail *= 1000000000;
+				break;
+			case 'T':
+				sd.sd_min_avail *= 1000000000000;
+				break;
+			default:
+				(void) fprintf(stderr,
+				    gettext("invalid minfree suffix '%s'"),
+				    optarg);
+				goto usage;
+			}
+			break;
+		case 'T':
+		  	if (str2time(optarg, &timeout, STR2TIME_RELATIVE) < 1 || timeout < 0) {
+			  	(void) fprintf(stderr,
+				    gettext("invalid timeout '%s'"), optarg ? optarg : "");
+				goto usage;
+			}
+			break;
+		case 'E':
+		  	expire_prop = strdup(optarg);
+			break;
+
+		case 'e':
+		  	if (str2time(optarg, &expire_time, STR2TIME_AFTER) < 1) {
+			  	(void) fprintf(stderr,
+				    gettext("invalid expire age '%s'"), optarg ? optarg : "");
+				goto usage;
+			}
+			break;
 		case 'o':
 			if (!parseprop(props, optarg)) {
 				nvlist_free(sd.sd_nvl);
@@ -4145,6 +4947,30 @@ zfs_do_snapshot(int argc, char **argv)
 		}
 	}
 
+	if (expire_time) {
+		char *ep;
+		
+		if (!expire_prop)
+			expire_prop = strdup(DEFAULT_EXPIRE_PROP);
+		
+		snprintf(buf, sizeof(buf), "%lu", expire_time);
+		
+		while ((ep = strsep(&expire_prop, ",")) != NULL) {
+			if (nvlist_lookup_string(props, ep, &strval) == 0) {
+				(void) fprintf(stderr, gettext("expire property '%s' "
+				    "specified multiple times\n"), ep);
+				goto usage;
+			}
+			if (nvlist_add_string(props, ep, buf) != 0)
+				nomem();
+		}
+	}
+
+	if (timeout) {
+		signal(SIGALRM, sigalrm_handler);
+		alarm(timeout);
+	}
+	
 	argc -= optind;
 	argv += optind;
 
@@ -4173,9 +4999,20 @@ zfs_do_snapshot(int argc, char **argv)
 			goto usage;
 	}
 
-	ret = zfs_snapshot_nvl(g_zfs, sd.sd_nvl, props);
+	ret = 0;
+	nsnaps = fnvlist_num_pairs(sd.sd_nvl);
+	  
+	if (!sd.sd_no_update && nsnaps > 0)
+		ret = zfs_snapshot_nvl(g_zfs, sd.sd_nvl, props);
+
 	nvlist_free(sd.sd_nvl);
 	nvlist_free(props);
+	
+	if (ret == 0 && sd.sd_verbose)
+		printf("Snapshots %screated: %ld\n",
+		       sd.sd_no_update ? "(NOT) " : "",
+		       nsnaps);
+	
 	if (ret != 0 && multiple_snaps)
 		(void) fprintf(stderr, gettext("no snapshots were created\n"));
 	return (ret != 0);
