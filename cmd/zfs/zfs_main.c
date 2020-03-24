@@ -2092,6 +2092,12 @@ clean_snapshots(zfs_handle_t *zhp,
 	  	goto OUT;
 	}
 	
+<<<<<<< HEAD
+=======
+	/* Print the snapshots to delete */
+	if (cb->cb_verbose || cb->cb_parsable)
+	  	err = destroy_print_snapshots(zhp, cb);
+>>>>>>> 0d28a80c3a385f6189cccbaf4e3dddf3ce42f10d
 	if (err != 0) {
 		fnvlist_free(cb->cb_nvl);
 		cb->cb_nvl = NULL;
